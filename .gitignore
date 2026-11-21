@@ -1,0 +1,7 @@
+node_modules/
+data/
+config.json
+*.log
+*.wlpkg.gz
+release-output/
+.tmp/
