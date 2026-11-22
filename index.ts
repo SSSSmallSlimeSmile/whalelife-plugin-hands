@@ -345,17 +345,25 @@ export async function apply(ctx: Context) {
       type: "object",
       properties: {
         path: { type: "string", description: "目录路径，可省略" },
-        depth: { type: "number", description: "递归层数，默认 1，最多 3" },
+        depth: { type: "number", minimum: 1, description: "递归层数，默认 1，上限 3；超过 3 会按 3 处理并标注" },
       },
       required: [],
     },
     danger: "safe",
     run: safe(async (args: any) => {
       const dir = guard(String(args?.path ?? base), "列目录");
-      const depth = Math.min(Math.max(Number(args?.depth ?? 1), 1), 3);
+      const asked = Number(args?.depth ?? 1);
+      if (!Number.isInteger(asked) || asked < 1) {
+        throw new Error(`depth 必须是 ≥1 的整数，收到 ${JSON.stringify(args?.depth)}`);
+      }
+      const depth = Math.min(asked, 3);
+      const notes: string[] = [];
+      if (asked > depth) notes.push(`depth 上限 3，已按 3 处理（请求的是 ${asked}）`);
+      let entriesCut = false;
       const lines: string[] = [];
       const walk = async (at: string, level: number) => {
         const items = await readdir(at, { withFileTypes: true });
+        if (items.length > 200) entriesCut = true;
         for (const it of items.slice(0, 200)) {
           lines.push(`${"  ".repeat(level)}${it.isDirectory() ? "[D]" : "[F]"} ${it.name}`);
           if (it.isDirectory() && level + 1 < depth) {
@@ -364,7 +372,9 @@ export async function apply(ctx: Context) {
         }
       };
       await walk(dir, 0);
-      return `${dir}\n${lines.join("\n") || "(空目录)"}`;
+      if (entriesCut) notes.push("每个目录最多列 200 项，多出来的没显示");
+      const tail = notes.length ? `\n（${notes.join("；")}）` : "";
+      return `${dir}\n${lines.join("\n") || "(空目录)"}${tail}`;
     }),
   });
 
@@ -375,24 +385,51 @@ export async function apply(ctx: Context) {
       type: "object",
       properties: {
         path: { type: "string" },
-        offset: { type: "number" },
-        limit: { type: "number" },
+        offset: { type: "number", minimum: 0, description: "起始行，从 0 开始；超出总行数会报错" },
+        limit: { type: "number", minimum: 1, description: "最多读几行，默认 400，上限 4000" },
       },
       required: ["path"],
     },
     danger: "safe",
     run: safe(async (args: any) => {
       const file = guard(String(args?.path ?? ""), "读文件");
-      const info = await stat(file);
+      const info = await stat(file).catch((error: any) => {
+        if (error?.code === "ENOENT") throw new Error(`文件不存在：${file}`);
+        if (error?.code === "EACCES" || error?.code === "EPERM") throw new Error(`没有权限读：${file}`);
+        throw new Error(`读不到 ${file}（${String(error?.code ?? error?.message ?? "未知")}）`);
+      });
       if (info.isDirectory()) throw new Error("这是目录，请用 hands_list");
-      const raw = await readFile(file, "utf8");
-      const lines = raw.split(/\r?\n/);
-      const offset = Math.max(0, Number(args?.offset ?? 0));
-      const limit = Math.min(Math.max(Number(args?.limit ?? 400), 1), 4000);
+      const rawBuffer = await readFile(file);
+      if (rawBuffer.byteLength === 0) return `${file}（空文件，0 字节）`;
+      const lines = rawBuffer.toString("utf8").split(/\r?\n/);
+      const total = lines.length;
+      if (args?.offset !== undefined && args?.offset !== null) {
+        const o = args.offset;
+        if (typeof o !== "number" || !Number.isInteger(o) || o < 0) {
+          throw new Error(`offset 必须是非负整数（从 0 开始），收到 ${JSON.stringify(o)}`);
+        }
+      }
+      if (args?.limit !== undefined && args?.limit !== null) {
+        const l = args.limit;
+        if (typeof l !== "number" || !Number.isInteger(l) || l < 1) {
+          throw new Error(`limit 必须是 ≥1 的整数，收到 ${JSON.stringify(l)}`);
+        }
+      }
+      const offset = args?.offset == null ? 0 : (args.offset as number);
+      const wantLimit = args?.limit == null ? 400 : (args.limit as number);
+      const limit = Math.min(wantLimit, 4000);
+      const limitNote = wantLimit > limit ? `；limit 上限 4000，已按 4000 处理（请求的是 ${wantLimit}）` : "";
+      if (offset > total) {
+        throw new Error(`offset ${offset} 超出范围：这个文件只有 ${total} 行（可用 0–${total}；等于 ${total} 表示已读完）`);
+      }
+      if (offset === total) {
+        return `${file}（共 ${total} 行）${limitNote}\noffset ${offset} 已经在末尾，没有更多内容`;
+      }
       const slice = lines.slice(offset, offset + limit);
-      const note = lines.length > offset + limit
-        ? `\n…… 共 ${lines.length} 行，已截到第 ${offset + slice.length} 行 ……` : "";
-      return trim(`${file}（${lines.length} 行）\n${slice.join("\n")}${note}`, cfg.max_output_chars);
+      const end = offset + slice.length;
+      const head = `${file}（第 ${offset + 1}–${end} 行，共 ${total} 行${limitNote}）`;
+      const note = end < total ? `\n…… 还有 ${total - end} 行没读，接着用 offset=${end} ……` : "";
+      return trim(`${head}\n${slice.join("\n")}${note}`, cfg.max_output_chars);
     }),
   });
 
