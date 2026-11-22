@@ -195,6 +195,13 @@ hands_run {
   备份失败就中止写入，不假装已经留了退路。
 - 支持 `expected_sha256`：给了就先比对当前文件哈希，不符直接拒写，并报出两边的前 12 位。
   读完文件、决定改之前，把读到的哈希带上。
+### 9. 为了在命令里能直接调 `tsc`，改 `execFile` 的 env，结果 PowerShell 起不来
+
+**现象**：改完之后每条命令都失败，报 `spawn powershell.exe ENOENT`。文件读写照常，只有跑命令全哑——`powershell.exe` 明明就在 `System32` 里。
+
+**原因**：Windows 的环境变量名不区分大小写，但 Node 在 Windows 上把 `process.env` 的键保留成 `Path`（首字母大写）。我另起一个 `PATH` 键去覆盖，对象里于是同时有 `Path` 和 `PATH`；传给子进程的那一刻，PATH 只剩插件自己的 `bin` 目录，系统目录没了，连 exe 都搜不到。写文件、跑测试都不受影响，所以看着像“只有命令坏了”。
+
+**修补**：不再碰 `execFile` 的 env。脚本第一行写 `$env:PATH = '<插件>\bin;' + $env:PATH`，在 PowerShell 内部前置，进程启动环境一行不动。同一个坑在宿主里也一样——要改 PATH 就改 `$env:PATH`，别改 `process.env`。
 ## 测试
 
 ```

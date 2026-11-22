@@ -91,14 +91,19 @@ function decodeOutput(buf: Buffer | undefined): string {
  * 临时文件必须带 UTF-8 BOM：Windows PowerShell 5.1 对无 BOM 的 .ps1 按当前 ANSI
  * 代码页解析，中文会变乱码。配置文件要无 BOM，这里正好相反。
  *
+ * 插件自带的 bin 目录（里面有 tsc.cmd 这类入口）要在脚本里前置到 $env:PATH，
+ * 而不是改 execFile 的 env——改 env 会让 Node 找不到 powershell.exe（ENOENT）。
+ *
  * 输出仍走 decodeOutput：控制台代码页是 936，PowerShell 自身输出是 GBK 字节。
  */
 async function runShell(command: string, cwd: string, timeout: number, signal?: AbortSignal) {
   const file = join(tmpdir(), `hands-${randomBytes(8).toString("hex")}.ps1`);
   const cleanup = () => { unlink(file).catch(() => {}); };
   try {
+    const binDir = join(dirname(fileURLToPath(import.meta.url)), "bin").replace(/'/g, "''");
     // 末尾补一句退出码：脚本最后一条命令失败时给个非零，否则 -File 恒为 0。
-    const body = `${command}\nif (-not $?) { exit 1 }\n`;
+    const body = "$env:PATH = '" + binDir + ";' + $env:PATH\n"
+      + command + "\nif (-not $?) { exit 1 }\n";
     await writeFile(file, Buffer.concat([
       Buffer.from([0xef, 0xbb, 0xbf]),
       Buffer.from(body, "utf8"),

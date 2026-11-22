@@ -1,6 +1,6 @@
 id: hands
 name: 手
 description: 让 WhaleLife 能在本机列目录、读写文件、跑命令行，路径受允许根目录约束
-version: 0.2.0
+version: 0.2.1
 apiVersion: "1"
 depends: []
