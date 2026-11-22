@@ -15,7 +15,7 @@ WhaleLife 主干只负责对话与插件框架，碰不到硬盘。这个插件�
 | `hands_list` | 列目录，`depth` 最多 3 层 | safe |
 | `hands_read` | 按行读文本文件 | safe |
 | `hands_write` | 写或追加文本，自动建父目录；覆盖前留副本，可带 `expected_sha256` 版本比对 | 需确认 |
-| `hands_run` | 跑 PowerShell 脚本，可带 `verify_files` 写后核验；输出只当轮可用 | 危险 |
+| `hands_run` | 跑 PowerShell 脚本，可带 `verify_files` 写后核验 | 危险 |
 
 ## 环境要求
 
@@ -208,6 +208,24 @@ hands_run {
 **原因**：Windows 的环境变量名不区分大小写，但 Node 在 Windows 上把 `process.env` 的键保留成 `Path`（首字母大写）。我另起一个 `PATH` 键去覆盖，对象里于是同时有 `Path` 和 `PATH`；传给子进程的那一刻，PATH 只剩插件自己的 `bin` 目录，系统目录没了，连 exe 都搜不到。写文件、跑测试都不受影响，所以看着像“只有命令坏了”。
 
 **修补**：不再碰 `execFile` 的 env。脚本第一行写 `$env:PATH = '<插件>\bin;' + $env:PATH`，在 PowerShell 内部前置，进程启动环境一行不动。同一个坑在宿主里也一样——要改 PATH 就改 `$env:PATH`，别改 `process.env`。
+### 10. 外部程序的 UTF-8 输出被当成 GBK 读
+
+**现象**　跑 `gh issue view`、`git log`、`node -e 'console.log("中文")'` 时，中文变成「鏆傛椂」「娴嬭瘯」这类字。把输出重定向进文件再读，还是那一串——看上去像 GitHub 或仓库里存坏了，其实是读的那一层坏了。
+
+**原因**　这些程序往 stdout 写的是 UTF-8 字节。Windows PowerShell 5.1 接收原生命令输出时按 `[Console]::OutputEncoding` 解码，简体中文系统上是 GBK（936）。字节进入 PowerShell 的那一刻就已经转错，插件后面再怎么严格解 UTF-8 也救不回来——它拿到的已经是转错码的字符。
+
+**修补**　在命令开头显式声明一次编码，让 PowerShell 按 UTF-8 收：
+
+```
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$OutputEncoding = [Text.Encoding]::UTF8
+gh issue view 13 --json title
+```
+
+`[Console]::OutputEncoding` 管收，`$OutputEncoding` 管往原生命令送参数时的写法，两个都设才不会一边好一边坏。设在脚本里是一次性的，不影响这台机器上别的窗口。
+
+插件本身**默认不改编码**，需要时自己把这两行写在命令开头。原因是改了会把所有命令的输出都当 UTF-8 读，`chcp 936` 环境下的一些老工具反而会坏——编码这件事，宁可让写命令的人明确声明。
+
 ## 测试
 
 ```
@@ -215,8 +233,8 @@ node test/smoke.mjs
 ```
 
 不经过宿主，直接加载插件本体，覆盖十三个用例：列目录、读文件、越界拒绝、
-`$` 不被展开、中文不乱码、失败命令非零退出码、禁止项拦截、写入、写后核验，
-再加临时输出（正文与回执分离）、覆盖前留副本、expected_sha256 不符拒写、相符放行。
+`$` 不被展开、中文不乱码、失败命令非零退出码、禁止项拦截、写入、写后核验、
+`hands_run` 只返回文本（无回执、无尾注）、覆盖前留副本、expected_sha256 不符拒写、相符放行。
 
 ## 许可
 
