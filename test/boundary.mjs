@@ -53,6 +53,10 @@ const r8 = await call("hands_read", { path: p3, limit: 0 });
 check("limit 0 拒绝", r8.includes("1 的整数"), r8.slice(0, 60));
 const l1 = await call("hands_list", { path: TMP, depth: 10 });
 check("depth 超限标注", l1.includes("depth 上限 3"), l1.trim().split("\n").slice(-1)[0]);
+const l3 = await call("hands_list", { path: TMP + "\\nope-dir" });
+check("不存在的目录友好报错", l3.startsWith("错误：目录不存在："), l3.slice(0, 60));
+const l4 = await call("hands_list", { path: TMP + "\\three.txt" });
+check("给文件当目录列，提示用 hands_read", l4.includes("不是目录"), l4.slice(0, 60));
 const l2 = await call("hands_list", { path: TMP, depth: 0 });
 check("depth 0 拒绝", l2.includes("1 的整数"), l2.slice(0, 60));
 

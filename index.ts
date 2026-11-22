@@ -352,6 +352,11 @@ export async function apply(ctx: Context) {
     danger: "safe",
     run: safe(async (args: any) => {
       const dir = guard(String(args?.path ?? base), "列目录");
+      const rootInfo = await stat(dir).catch((error: any) => {
+        if (error?.code === "ENOENT") throw new Error(`目录不存在：${dir}`);
+        throw new Error(`列目录失败：${error?.message ?? error}`);
+      });
+      if (!rootInfo.isDirectory()) throw new Error(`这不是目录，是文件，请用 hands_read 读它：${dir}`);
       const asked = Number(args?.depth ?? 1);
       if (!Number.isInteger(asked) || asked < 1) {
         throw new Error(`depth 必须是 ≥1 的整数，收到 ${JSON.stringify(args?.depth)}`);
