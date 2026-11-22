@@ -102,7 +102,7 @@ async function runShell(command: string, cwd: string, timeout: number, signal?: 
     const binDir = join(dirname(fileURLToPath(import.meta.url)), "bin").replace(/'/g, "''");
     // 末尾补一句退出码：脚本最后一条命令失败时给个非零，否则 -File 恒为 0。
     const body = "$env:PATH = '" + binDir + ";' + $env:PATH\n"
-      + (prelude ? "[Console]::OutputEncoding = [Text.Encoding]::UTF8`n$OutputEncoding = [Text.Encoding]::UTF8`n" : "")
+      + (prelude ? "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n$OutputEncoding = [Text.Encoding]::UTF8\n" : "")
       + command + "\nif (-not $?) { exit 1 }\n";
     await writeFile(file, Buffer.concat([
       Buffer.from([0xef, 0xbb, 0xbf]),
