@@ -3,9 +3,11 @@
  * 用法：node test/smoke.mjs   （在插件目录下跑；需要 Node 24）
  *
  * 不依赖插件装在宿主里的位置：允许根目录就是当前工作目录（本仓库根），
- * 写测试的临时文件落在 .tmp/ 下，跑完删掉。
+ * 写测试的临时文件落在 .tmp/ 下，跑完删掉；备份落在 data/backups/（已在 .gitignore）。
+ *
+ * 这里同时模拟宿主提供 registerTransient，用来验证 hands_run 的临时输出路径。
  */
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { apply } from "../index.ts";
 
@@ -17,7 +19,10 @@ const defs = [];
 const disposers = [];
 const ctx = {
   config: { read: async () => null },          // 走默认配置：roots 回落到 cwd
-  tools: { register: (def) => defs.push(def) },
+  tools: {
+    register: (def) => defs.push(def),
+    registerTransient: (def) => defs.push(def), // 模拟支持临时输出的宿主
+  },
   effect: (fn) => { disposers.push(fn()); return () => {}; },
   logger: { info: () => {}, warn: () => {}, error: () => {} },
 };
@@ -30,7 +35,12 @@ const find = (name) => {
   if (!d) throw new Error(`工具未注册：${name}`);
   return d;
 };
-const call = async (name, args) => String(await find(name).run(args ?? {}, {}));
+const raw = async (name, args) => await find(name).run(args ?? {}, {});
+const call = async (name, args) => {
+  const out = await raw(name, args);
+  if (out && typeof out === "object" && "content" in out) return String(out.content);
+  return String(out);
+};
 
 const cases = [];
 const check = (label, ok, detail) => cases.push({ label, ok, detail });
@@ -75,6 +85,58 @@ check(
   "verify_files 通过",
   /已验证变化 0，已满足无变化 1，验证失败 0/.test(verify) && !verify.includes("文件核验未通过"),
   verify.split("\n")[1] ?? verify.split("\n")[0],
+);
+
+// 9 临时输出：正文与回执分开，回执里没有 stdout
+const transient = await raw("hands_run", { command: 'Write-Output "临时正文"' });
+check(
+  "hands_run 走临时输出（正文 + 纯 JSON 回执）",
+  transient && typeof transient === "object" && typeof transient.content === "string"
+    && transient.content.includes("临时正文")
+    && transient.receipt && typeof transient.receipt === "object"
+    && !("stdout" in transient.receipt) && !("content" in transient.receipt)
+    && transient.receipt.tool === "hands_run",
+  JSON.stringify(transient?.receipt ?? null).slice(0, 100),
+);
+
+// 10 覆盖前留副本
+const backupTarget = ".tmp/smoke-backup.txt";
+await call("hands_write", { path: backupTarget, content: "第一版\n" });
+const overwrite = await call("hands_write", { path: backupTarget, content: "第二版\n" });
+let backupCount = 0;
+try {
+  backupCount = (await readdir(resolve(ROOT, "data", "backups"))).filter((n) => n.includes("smoke-backup")).length;
+} catch { backupCount = 0; }
+check(
+  "覆盖前留副本",
+  overwrite.includes("原文件已备份") && backupCount > 0,
+  `${overwrite.split("\n")[1] ?? overwrite.split("\n")[0]} / 目录中 ${backupCount} 份`,
+);
+
+// 11 版本比对：哈希不符拒写，文件内容不变
+const beforeSha = await call("hands_run", {
+  command: `(Get-FileHash -Algorithm SHA256 -LiteralPath '${backupTarget.replace(/\\/g, "\\\\")}').Hash`,
+});
+const wrong = await call("hands_write", {
+  path: backupTarget, content: "第三版\n", expected_sha256: "0".repeat(64),
+});
+const afterRead = await call("hands_read", { path: backupTarget });
+check(
+  "expected_sha256 不符时拒写",
+  wrong.startsWith("错误：版本比对失败") && afterRead.includes("第二版") && !afterRead.includes("第三版"),
+  wrong.slice(0, 80),
+);
+
+// 12 版本比对：哈希对得上就放行
+const realSha = (beforeSha.match(/[0-9A-Fa-f]{64}/) ?? [""])[0].toLowerCase();
+const right = await call("hands_write", {
+  path: backupTarget, content: "第三版\n", expected_sha256: realSha,
+});
+const finalRead = await call("hands_read", { path: backupTarget });
+check(
+  "expected_sha256 相符时写入",
+  realSha.length === 64 && right.includes("已写入") && finalRead.includes("第三版"),
+  right.split("\n")[0],
 );
 
 await rm(TMP, { recursive: true, force: true });

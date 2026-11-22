@@ -1,18 +1,27 @@
 /*! WhaleLife「手」插件：跑命令、读写文件、列目录。
  * 只调用公开接口；所有异常在本插件内收口，绝不向宿主抛出——
  * 宿主的 worker 包装器把工具异常视为插件故障，会直接撤销全部工具入口。
+ *
+ * 两条借自上游 computer 插件的做法：
+ *  1. hands_run 走 registerTransient：命令输出只给当轮模型看，长期记忆里只留
+ *     一条精简回执（退出码、目录、核验统计），不留整屏 stdout。
+ *  2. hands_write 覆盖已有文件前先留副本（30 天 / 1 GiB 上限），并支持
+ *     expected_sha256 做版本比对——对不上就拒写，不静默盖掉别人的改动。
  */
 import type { Context } from "../../core/context.ts";
 import { execFile } from "node:child_process";
 import { readFile, writeFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
-import { resolve, dirname, isAbsolute, sep, join } from "node:path";
+import { resolve, dirname, isAbsolute, sep, join, basename } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 
 const DEFAULTS = {
   roots: [], // 留空表示未配置：回落到宿主自己的工作目录，不把作者机器路径写进包里
   timeout_ms: 60_000,
   max_output_chars: 20_000,
+  backup_keep_days: 30,
+  backup_max_bytes: 1024 * 1024 * 1024,
   deny_patterns: [
     "format ", "diskpart", "mkfs", "bcdedit", "reg delete",
     "shutdown", "restart-computer", "stop-computer",
@@ -153,6 +162,73 @@ export async function apply(ctx: Context) {
   };
 
   const base = roots[0] === "*" ? resolve(".") : roots[0];
+
+  /**
+   * 备份目录落在插件自己的 data/backups 下，跟 roots 无关——
+   * 这样即使 roots 只剩一个子目录，副本也写得进去。
+   * 位置用 import.meta.url 推，插件被装在哪都能用。
+   */
+  let backupDirCache: string | null = null;
+  const backupDir = async () => {
+    if (!backupDirCache) {
+      const here = dirname(fileURLToPath(import.meta.url));
+      backupDirCache = join(here, "data", "backups");
+      await mkdir(backupDirCache, { recursive: true });
+    }
+    return backupDirCache;
+  };
+
+  /** 按上限清理：先按时间删过期的，再按最旧的删到总量达标。 */
+  const pruneBackups = async (dir: string) => {
+    const keepDays = Math.max(1, Number(cfg.backup_keep_days) || 30);
+    const maxBytes = Math.max(1024 * 1024, Number(cfg.backup_max_bytes) || 1024 * 1024 * 1024);
+    let items: { path: string; size: number; mtime: number }[] = [];
+    try {
+      const names = await readdir(dir);
+      for (const name of names) {
+        const full = join(dir, name);
+        try {
+          const info = await stat(full);
+          if (info.isFile()) items.push({ path: full, size: info.size, mtime: info.mtimeMs });
+        } catch { /* 单个文件读不到就跳过，别让清理影响主流程 */ }
+      }
+    } catch { return; }
+    const now = Date.now();
+    const expire = keepDays * 24 * 60 * 60 * 1000;
+    const kept: typeof items = [];
+    for (const item of items) {
+      if (now - item.mtime > expire) {
+        await unlink(item.path).catch(() => {});
+      } else {
+        kept.push(item);
+      }
+    }
+    let total = kept.reduce((sum, item) => sum + item.size, 0);
+    kept.sort((a, b) => a.mtime - b.mtime);
+    for (const item of kept) {
+      if (total <= maxBytes) break;
+      await unlink(item.path).catch(() => {});
+      total -= item.size;
+    }
+  };
+
+  /** 覆盖前留一份原始字节。文件本来不存在就返回 null，不算失败。 */
+  const backupFile = async (file: string): Promise<{ path: string; bytes: number; sha256: string } | null> => {
+    let before: Buffer;
+    try {
+      before = await readFile(file);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return null;
+      throw new Error(`备份原文件时读不到：${file}（${String(error?.code ?? error?.message ?? "未知")}）`);
+    }
+    const dir = await backupDir();
+    const sha256 = createHash("sha256").update(before).digest("hex");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").replace("Z", "");
+    const dest = join(dir, `${stamp}-${sha256.slice(0, 8)}-${basename(file)}`);
+    await writeFile(dest, before);
+    await pruneBackups(dir);
+    return { path: dest, bytes: before.byteLength, sha256 };
+  };
 
   /** 一次读回的快照：字节数、sha256、以及跑字面量断言用的文本都来自同一份 Buffer。 */
   type Snapshot = { exists: boolean; bytes: number | null; sha256: string | null; text: string };
@@ -317,13 +393,20 @@ export async function apply(ctx: Context) {
 
   ctx.tools.register({
     name: "hands_write",
-    description: "写文本文件，自动建父目录。append 为 true 时追加，否则覆盖。",
+    description:
+      "写文本文件，自动建父目录。append 为 true 时追加，否则覆盖。" +
+      "覆盖或追加已有文件前，会先把原文备份到插件 data/backups（按天数与总量自动清理）；" +
+      "给了 expected_sha256 时先比对当前文件哈希，不一致就拒写——用于防止盖掉别人刚做的改动。",
     schema: {
       type: "object",
       properties: {
         path: { type: "string" },
         content: { type: "string" },
         append: { type: "boolean" },
+        expected_sha256: {
+          type: "string",
+          description: "可选。当前文件的 sha256；不符则拒写。用于覆盖保护。",
+        },
       },
       required: ["path", "content"],
     },
@@ -333,6 +416,23 @@ export async function apply(ctx: Context) {
       await mkdir(dirname(file), { recursive: true });
       const append = Boolean(args?.append);
       const payload = Buffer.from(String(args?.content ?? ""), "utf8");
+
+      // 版本比对先做：对不上就不能动文件，连备份也不该产生。
+      const expected = typeof args?.expected_sha256 === "string"
+        ? args.expected_sha256.trim().toLowerCase() : "";
+      const before = await snapshot(file);
+      if (expected) {
+        if (!before.exists)
+          throw new Error(`版本比对失败：${file} 当前不存在，却给了 expected_sha256，未写入`);
+        if (before.sha256 !== expected)
+          throw new Error(`版本比对失败：${file} 当前 sha256 是 ${String(before.sha256).slice(0, 12)}…，`
+            + `与 expected_sha256 不符，未写入`);
+      }
+
+      // 覆盖/追加前留副本。备份失败要报出来，不能当作已经有了退路。
+      let backup: { path: string; bytes: number; sha256: string } | null = null;
+      if (before.exists) backup = await backupFile(file);
+
       await writeFile(file, payload, { flag: append ? "a" : "w" });
       // 写成功后立刻回读，通过宿主提供的通用证据契约上报操作事实：
       // 字节数与 sha256 只来自回读，不用写前估算；任务归属由宿主绑定，本插件不自报。
@@ -357,19 +457,100 @@ export async function apply(ctx: Context) {
         if (typeof session?.evidence === "function") { session.evidence(evidence); reported = "sent"; }
       } catch { reported = "failed"; }
       const info = await stat(file);
+      const backupNote = backup
+        ? `\n原文件已备份：${backup.path}（${backup.bytes} 字节，sha256 ${backup.sha256.slice(0, 12)}…）`
+        : "";
       if (evidence.read_back === "ok")
-        return `已写入 ${file}（${info.size} 字节，回读一致，证据 ${reported}）`;
-      return `写入后回读失败：${file}（磁盘上 ${info.size} 字节，证据 ${reported}）。这条结果不能当作写入成功。`;
+        return `已写入 ${file}（${info.size} 字节，回读一致，证据 ${reported}）${backupNote}`;
+      return `写入后回读失败：${file}（磁盘上 ${info.size} 字节，证据 ${reported}）。这条结果不能当作写入成功。${backupNote}`;
     }),
   });
 
-  ctx.tools.register({
+  /**
+   * hands_run 的输出常常一整屏，进长期记忆既没用也挤上下文。
+   * 宿主支持 registerTransient 时，正文只给当轮；记忆里只留一条精简回执。
+   * 老宿主没有这个接口时退回普通注册（行为照旧，输出照旧入档），不假装是临时的。
+   */
+  const transientSupported = typeof (ctx.tools as any).registerTransient === "function";
+
+  const runHands = async (args: any, session: any) => {
+    const command = String(args?.command ?? "").trim();
+    if (!command) throw new Error("command 不能为空");
+    const lowered = command.toLowerCase();
+    const blocked = cfg.deny_patterns.find((p: string) => lowered.includes(String(p).toLowerCase()));
+    if (blocked) throw new Error(`命令被拒绝：命中禁止项「${blocked}」`);
+    const cwd = guard(String(args?.cwd ?? base), "执行目录");
+    const timeout = Math.min(Math.max(Number(args?.timeout_ms ?? cfg.timeout_ms), 1000), 600_000);
+
+    // 参数、路径、基线都必须在执行命令之前定下来：参数错了不能已经动过文件。
+    const planned = planVerify(args?.verify_files, cwd);
+    const baselines = new Map<string, Snapshot>();
+    for (const item of planned) baselines.set(item.abs, await snapshot(item.abs));
+
+    const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal);
+    const out = trim(r.stdout, cfg.max_output_chars);
+    const err = trim(r.stderr, Math.floor(cfg.max_output_chars / 3));
+
+    // 核验摘要放最前面，不被 stdout/stderr 的截断吃掉。
+    const head: string[] = [
+      planned.length ? `退出码 ${r.code}` : `退出码 ${r.code}（未声明 verify_files，文件未验证）`,
+    ];
+    // 嵌套 -Command 的双引号里带 $ 时，外层会先展开、内层拿到字面量；
+    // 这种错可能以退出码 0 结束，所以不管成功失败都要提示。
+    const nestedDollar =
+      /(?:^|[\s;&|])(?:powershell|pwsh)(?:\.exe)?\s+(?:-[a-z]+\s+)*-command\s+"[^\r\n]*\$(?:[\w{?(])/i.test(
+        command,
+      );
+    if (nestedDollar) {
+      head.push(
+        r.code !== 0
+          ? "调用提示：hands_run 已在 PowerShell 内执行。嵌套 -Command 的双引号会先展开 $ 变量；请直接传 PowerShell 脚本。"
+          : "调用提示：这条命令里嵌了 powershell -Command，双引号内的 $ 会被外层先展开。结果对不上就改成直接写 PowerShell 脚本。",
+      );
+    }
+    const counts = { changed: 0, unchanged: 0, failed: 0 };
+    if (planned.length) {
+      const lines: string[] = [];
+      for (const item of planned) {
+        const verdict = await verifyFile(item, baselines.get(item.abs)!);
+        if (verdict.state === "changed") counts.changed += 1;
+        else if (verdict.state === "unchanged") counts.unchanged += 1;
+        else counts.failed += 1;
+        lines.push(verdict.line);
+        reportVerified(session, item, verdict);
+      }
+      head.push(`--- 文件核验 --- 已验证变化 ${counts.changed}，已满足无变化 ${counts.unchanged}，验证失败 ${counts.failed}`);
+      head.push(...lines);
+      if (counts.failed) head.push("文件核验未通过：这次不能算全部完成。");
+    }
+
+    const text = [
+      ...head,
+      out ? `--- stdout ---\n${out}` : "",
+      err ? `--- stderr ---\n${err}` : "",
+    ].filter(Boolean).join("\n");
+
+    // 回执只放能长期看的事实：退出码、目录、命令抬头、核验统计。不放正文。
+    const receipt = {
+      tool: "hands_run",
+      exit_code: r.code,
+      cwd,
+      command: command.length > 200 ? `${command.slice(0, 200)}…` : command,
+      verify: planned.length
+        ? { files: planned.length, ...counts }
+        : null,
+    };
+    return { text, receipt };
+  };
+
+  const runTool: any = {
     name: "hands_run",
     description:
       "在允许目录内用 Windows PowerShell 执行 command，返回退出码、标准输出与错误输出。命令有超时与拒绝清单约束。" +
       "脚本先落成临时 .ps1 再以 -File 执行，双引号里的 $ 不会被外层展开；直接写 PowerShell 脚本，如 \"$value = 42; Write-Output $value\"。" +
       "调用外部程序（node、git 等）照常写；不要再包一层 powershell -Command。" +
-      "改文件时用 verify_files 声明预期内容，命令跑完会回读核验并逐文件报告；不声明就只能说命令执行过，文件未验证。",
+      "改文件时用 verify_files 声明预期内容，命令跑完会回读核验并逐文件报告；不声明就只能说命令执行过，文件未验证。" +
+      "输出正文只在当轮可用，长期记忆里只留退出码与核验统计；需要留档的内容请写进文件。",
     schema: {
       type: "object",
       properties: {
@@ -395,64 +576,21 @@ export async function apply(ctx: Context) {
       required: ["command"],
     },
     danger: "full",
-    run: safe(async (args: any, session: any) => {
-      const command = String(args?.command ?? "").trim();
-      if (!command) throw new Error("command 不能为空");
-      const lowered = command.toLowerCase();
-      const blocked = cfg.deny_patterns.find((p: string) => lowered.includes(String(p).toLowerCase()));
-      if (blocked) throw new Error(`命令被拒绝：命中禁止项「${blocked}」`);
-      const cwd = guard(String(args?.cwd ?? base), "执行目录");
-      const timeout = Math.min(Math.max(Number(args?.timeout_ms ?? cfg.timeout_ms), 1000), 600_000);
-
-      // 参数、路径、基线都必须在执行命令之前定下来：参数错了不能已经动过文件。
-      const planned = planVerify(args?.verify_files, cwd);
-      const baselines = new Map<string, Snapshot>();
-      for (const item of planned) baselines.set(item.abs, await snapshot(item.abs));
-
-      const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal);
-      const out = trim(r.stdout, cfg.max_output_chars);
-      const err = trim(r.stderr, Math.floor(cfg.max_output_chars / 3));
-
-      // 核验摘要放最前面，不被 stdout/stderr 的截断吃掉。
-      const head: string[] = [
-        planned.length ? `退出码 ${r.code}` : `退出码 ${r.code}（未声明 verify_files，文件未验证）`,
-      ];
-      // 嵌套 -Command 的双引号里带 $ 时，外层会先展开、内层拿到字面量；
-      // 这种错可能以退出码 0 结束，所以不管成功失败都要提示。
-      const nestedDollar =
-        /(?:^|[\s;&|])(?:powershell|pwsh)(?:\.exe)?\s+(?:-[a-z]+\s+)*-command\s+"[^\r\n]*\$(?:[\w{?(])/i.test(
-          command,
-        );
-      if (nestedDollar) {
-        head.push(
-          r.code !== 0
-            ? "调用提示：hands_run 已在 PowerShell 内执行。嵌套 -Command 的双引号会先展开 $ 变量；请直接传 PowerShell 脚本。"
-            : "调用提示：这条命令里嵌了 powershell -Command，双引号内的 $ 会被外层先展开。结果对不上就改成直接写 PowerShell 脚本。",
-        );
+    run: async (args: any, session: any) => {
+      try {
+        const result = await runHands(args, session);
+        return transientSupported
+          ? { content: result.text, receipt: result.receipt }
+          : result.text;
+      } catch (error: any) {
+        const message = `错误：${error?.message ?? String(error)}`;
+        return transientSupported ? { content: message, receipt: null } : message;
       }
-      if (planned.length) {
-        const lines: string[] = [];
-        let changed = 0, unchanged = 0, failed = 0;
-        for (const item of planned) {
-          const verdict = await verifyFile(item, baselines.get(item.abs)!);
-          if (verdict.state === "changed") changed += 1;
-          else if (verdict.state === "unchanged") unchanged += 1;
-          else failed += 1;
-          lines.push(verdict.line);
-          reportVerified(session, item, verdict);
-        }
-        head.push(`--- 文件核验 --- 已验证变化 ${changed}，已满足无变化 ${unchanged}，验证失败 ${failed}`);
-        head.push(...lines);
-        if (failed) head.push("文件核验未通过：这次不能算全部完成。");
-      }
+    },
+  };
 
-      return [
-        ...head,
-        out ? `--- stdout ---\n${out}` : "",
-        err ? `--- stderr ---\n${err}` : "",
-      ].filter(Boolean).join("\n");
-    }),
-  });
+  if (transientSupported) (ctx.tools as any).registerTransient(runTool);
+  else ctx.tools.register(runTool);
 
   ctx.effect(() => () => {
     ctx.logger.info("hands 已清理");
