@@ -63,6 +63,7 @@ WhaleLife 主干只负责对话与插件框架，碰不到硬盘。这个插件�
 | `max_output_chars` | `20000` | 输出超过这个长度就掐头去尾保留中间提示 |
 | `backup_keep_days` | `30` | 覆盖前副本保留天数，过期自动删 |
 | `backup_max_bytes` | `1073741824` | 副本目录总量上限，超了从最旧的删 |
+| `encoding_prelude` | `false` | 设 `true` 时每条命令前自动加控制台 UTF-8 两行（见坑 10），默认不加 |
 | `deny_patterns` | 见源码 | 命中即拒绝的命令片段，如 `format `、`diskpart`、`reg delete` |
 
 写进 `config.json` 的键会覆盖默认值；没写的键沿用默认。

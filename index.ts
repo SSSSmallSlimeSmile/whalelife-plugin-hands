@@ -20,6 +20,7 @@ const DEFAULTS = {
   max_output_chars: 20_000,
   backup_keep_days: 30,
   backup_max_bytes: 1024 * 1024 * 1024,
+  encoding_prelude: false, // true 时给每条命令加上控制台 UTF-8 两行（README 第 10 条）
   deny_patterns: [
     "format ", "diskpart", "mkfs", "bcdedit", "reg delete",
     "shutdown", "restart-computer", "stop-computer",
@@ -94,13 +95,14 @@ function decodeOutput(buf: Buffer | undefined): string {
  *
  * 输出仍走 decodeOutput：控制台代码页是 936，PowerShell 自身输出是 GBK 字节。
  */
-async function runShell(command: string, cwd: string, timeout: number, signal?: AbortSignal) {
+async function runShell(command: string, cwd: string, timeout: number, signal?: AbortSignal, prelude = false) {
   const file = join(tmpdir(), `hands-${randomBytes(8).toString("hex")}.ps1`);
   const cleanup = () => { unlink(file).catch(() => {}); };
   try {
     const binDir = join(dirname(fileURLToPath(import.meta.url)), "bin").replace(/'/g, "''");
     // 末尾补一句退出码：脚本最后一条命令失败时给个非零，否则 -File 恒为 0。
     const body = "$env:PATH = '" + binDir + ";' + $env:PATH\n"
+      + (prelude ? "[Console]::OutputEncoding = [Text.Encoding]::UTF8`n$OutputEncoding = [Text.Encoding]::UTF8`n" : "")
       + command + "\nif (-not $?) { exit 1 }\n";
     await writeFile(file, Buffer.concat([
       Buffer.from([0xef, 0xbb, 0xbf]),
@@ -483,7 +485,7 @@ export async function apply(ctx: Context) {
     const baselines = new Map<string, Snapshot>();
     for (const item of planned) baselines.set(item.abs, await snapshot(item.abs));
 
-    const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal);
+    const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal, cfg.encoding_prelude === true);
     const out = trim(r.stdout, cfg.max_output_chars);
     const err = trim(r.stderr, Math.floor(cfg.max_output_chars / 3));
 
