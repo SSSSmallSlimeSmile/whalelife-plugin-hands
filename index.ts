@@ -2,10 +2,8 @@
  * 只调用公开接口；所有异常在本插件内收口，绝不向宿主抛出——
  * 宿主的 worker 包装器把工具异常视为插件故障，会直接撤销全部工具入口。
  *
- * 两条借自上游 computer 插件的做法：
- *  1. hands_run 走 registerTransient：命令输出只给当轮模型看，长期记忆里只留
- *     一条精简回执（退出码、目录、核验统计），不留整屏 stdout。
- *  2. hands_write 覆盖已有文件前先留副本（30 天 / 1 GiB 上限），并支持
+ * 一条借自上游 computer 插件的做法：
+ *  hands_write 覆盖已有文件前先留副本（30 天 / 1 GiB 上限），并支持
  *     expected_sha256 做版本比对——对不上就拒写，不静默盖掉别人的改动。
  */
 import type { Context } from "../../core/context.ts";
@@ -471,13 +469,6 @@ export async function apply(ctx: Context) {
     }),
   });
 
-  /**
-   * hands_run 的输出常常一整屏，进长期记忆既没用也挤上下文。
-   * 宿主支持 registerTransient 时，正文只给当轮；记忆里只留一条精简回执。
-   * 老宿主没有这个接口时退回普通注册（行为照旧，输出照旧入档），不假装是临时的。
-   */
-  const transientSupported = typeof (ctx.tools as any).registerTransient === "function";
-
   const runHands = async (args: any, session: any) => {
     const command = String(args?.command ?? "").trim();
     if (!command) throw new Error("command 不能为空");
@@ -498,7 +489,7 @@ export async function apply(ctx: Context) {
 
     // 核验摘要放最前面，不被 stdout/stderr 的截断吃掉。
     const head: string[] = [
-      planned.length ? `退出码 ${r.code}` : `退出码 ${r.code}（未声明 verify_files，文件未验证）`,
+      `退出码 ${r.code}`,
     ];
     // 嵌套 -Command 的双引号里带 $ 时，外层会先展开、内层拿到字面量；
     // 这种错可能以退出码 0 结束，所以不管成功失败都要提示。
@@ -535,17 +526,7 @@ export async function apply(ctx: Context) {
       err ? `--- stderr ---\n${err}` : "",
     ].filter(Boolean).join("\n");
 
-    // 回执只放能长期看的事实：退出码、目录、命令抬头、核验统计。不放正文。
-    const receipt = {
-      tool: "hands_run",
-      exit_code: r.code,
-      cwd,
-      command: command.length > 200 ? `${command.slice(0, 200)}…` : command,
-      verify: planned.length
-        ? { files: planned.length, ...counts }
-        : null,
-    };
-    return { text, receipt };
+    return text;
   };
 
   const runTool: any = {
@@ -554,8 +535,7 @@ export async function apply(ctx: Context) {
       "在允许目录内用 Windows PowerShell 执行 command，返回退出码、标准输出与错误输出。命令有超时与拒绝清单约束。" +
       "脚本先落成临时 .ps1 再以 -File 执行，双引号里的 $ 不会被外层展开；直接写 PowerShell 脚本，如 \"$value = 42; Write-Output $value\"。" +
       "调用外部程序（node、git 等）照常写；不要再包一层 powershell -Command。" +
-      "改文件时用 verify_files 声明预期内容，命令跑完会回读核验并逐文件报告；不声明就只能说命令执行过，文件未验证。" +
-      "输出正文只在当轮可用，长期记忆里只留退出码与核验统计；需要留档的内容请写进文件。",
+      "改文件时用 verify_files 声明预期内容，命令跑完会回读核验并逐文件报告。",
     schema: {
       type: "object",
       properties: {
@@ -583,19 +563,14 @@ export async function apply(ctx: Context) {
     danger: "full",
     run: async (args: any, session: any) => {
       try {
-        const result = await runHands(args, session);
-        return transientSupported
-          ? { content: result.text, receipt: result.receipt }
-          : result.text;
+        return await runHands(args, session);
       } catch (error: any) {
-        const message = `错误：${error?.message ?? String(error)}`;
-        return transientSupported ? { content: message, receipt: null } : message;
+        return `错误：${error?.message ?? String(error)}`;
       }
     },
   };
 
-  if (transientSupported) (ctx.tools as any).registerTransient(runTool);
-  else ctx.tools.register(runTool);
+  ctx.tools.register(runTool);
 
   ctx.effect(() => () => {
     ctx.logger.info("hands 已清理");

@@ -5,7 +5,7 @@
  * 不依赖插件装在宿主里的位置：允许根目录就是当前工作目录（本仓库根），
  * 写测试的临时文件落在 .tmp/ 下，跑完删掉；备份落在 data/backups/（已在 .gitignore）。
  *
- * 这里同时模拟宿主提供 registerTransient，用来验证 hands_run 的临时输出路径。
+ * 这里仍然模拟宿主提供 registerTransient：手已经不用它了，留着是为了确认即便宿主
  */
 import { mkdir, rm, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -21,7 +21,7 @@ const ctx = {
   config: { read: async () => null },          // 走默认配置：roots 回落到 cwd
   tools: {
     register: (def) => defs.push(def),
-    registerTransient: (def) => defs.push(def), // 模拟支持临时输出的宿主
+    registerTransient: (def) => defs.push(def), // 宿主给了也不会改变返回值形状
   },
   effect: (fn) => { disposers.push(fn()); return () => {}; },
   logger: { info: () => {}, warn: () => {}, error: () => {} },
@@ -87,16 +87,15 @@ check(
   verify.split("\n")[1] ?? verify.split("\n")[0],
 );
 
-// 9 临时输出：正文与回执分开，回执里没有 stdout
-const transient = await raw("hands_run", { command: 'Write-Output "临时正文"' });
+// 9 只返回文本：没有回执对象，也不带「文件未验证」这类尾注
+const plain = await raw("hands_run", { command: 'Write-Output "临时正文"' });
 check(
-  "hands_run 走临时输出（正文 + 纯 JSON 回执）",
-  transient && typeof transient === "object" && typeof transient.content === "string"
-    && transient.content.includes("临时正文")
-    && transient.receipt && typeof transient.receipt === "object"
-    && !("stdout" in transient.receipt) && !("content" in transient.receipt)
-    && transient.receipt.tool === "hands_run",
-  JSON.stringify(transient?.receipt ?? null).slice(0, 100),
+  "hands_run 只返回文本（无回执、无尾注）",
+  typeof plain === "string"
+    && plain.includes("临时正文")
+    && plain.startsWith("退出码 0")
+    && !plain.includes("未声明 verify_files"),
+  String(plain).split("\n")[0],
 );
 
 // 10 覆盖前留副本
