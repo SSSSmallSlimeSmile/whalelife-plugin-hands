@@ -74,7 +74,7 @@ function decodeOutput(buf: Buffer | undefined): string {
   if (!buf || !buf.length) return "";
   const utf8 = tryDecode(buf, "utf-8");
   if (utf8 === null) return tryDecode(buf, "gbk") ?? buf.toString("utf8");
-  if (!/[\u0400-\u07FF]/.test(utf8)) return utf8;
+  if (!/[\u0400-\u07FF\uFFFD]/.test(utf8)) return utf8;
   const gbk = tryDecode(buf, "gbk");
   if (gbk && !gbk.includes("\uFFFD") && /[\u4e00-\u9fff]/.test(gbk)) return gbk;
   return utf8;
@@ -527,7 +527,7 @@ export async function apply(ctx: Context) {
     const baselines = new Map<string, Snapshot>();
     for (const item of planned) baselines.set(item.abs, await snapshot(item.abs));
 
-    const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal, cfg.encoding_prelude === true);
+    const r = await runShell(command, cwd, timeout, session?.signal ?? ctx.signal, cfg.encoding_prelude !== false);
     const out = trim(r.stdout, cfg.max_output_chars);
     const err = trim(r.stderr, Math.floor(cfg.max_output_chars / 3));
 
