@@ -21,6 +21,7 @@ const DEFAULTS = {
   backup_keep_days: 30,
   backup_max_bytes: 1024 * 1024 * 1024,
   encoding_prelude: false, // true 时给每条命令加上控制台 UTF-8 两行（README 第 10 条）
+  transient_output: true, // 命令正文只当轮可见，长期记忆只留极简回执；关掉则整段输出永久入档
   deny_patterns: [
     "format ", "diskpart", "mkfs", "bcdedit", "reg delete",
     "shutdown", "restart-computer", "stop-computer",
@@ -614,7 +615,54 @@ export async function apply(ctx: Context) {
     },
   };
 
-  ctx.tools.register(runTool);
+  // 命令正文走临时输出：只当轮可见，长期记忆里只留一条极简回执。
+  // 正文动辄几十 KB，一旦入档就会在之后每一轮被重发，上下文成倍膨胀。
+  // 宿主要求临时工具必须返回 { content, receipt }，且 receipt 必须是有界 JSON。
+  const transientCapable = typeof (ctx.tools as any).registerTransient === "function";
+  const transientOn = cfg.transient_output !== false && transientCapable;
+
+  const runTransient: any = {
+    ...runTool,
+    description:
+      runTool.description +
+      "命令输出只在本次回复内可见，长期记忆里只留一条极简回执（退出码、核验计数、耗时）。",
+    run: async (args: any, session: any) => {
+      const started = Date.now();
+      let text: string;
+      let ok = true;
+      try {
+        text = await runHands(args, session);
+        ok = !/^退出码 [1-9]/.test(text);
+      } catch (error: any) {
+        text = `错误：${error?.message ?? String(error)}`;
+        ok = false;
+      }
+      // 回执只放能核账的字段：不抄正文、不抄 stderr、不抄命令全貌。
+      const exit = /^退出码 (-?\d+)/.exec(text);
+      const verify = /已验证变化 (\d+)，已满足无变化 (\d+)，验证失败 (\d+)/.exec(text);
+      const receipt: any = {
+        tool: "hands_run",
+        ok,
+        exit_code: exit ? Number(exit[1]) : null,
+        command_head: String(args?.command ?? "").replace(/\s+/g, " ").slice(0, 120),
+        output_chars: text.length,
+        ms: Date.now() - started,
+      };
+      const cwd = String(args?.cwd ?? "").trim();
+      if (cwd) receipt.cwd = cwd.slice(0, 200);
+      if (verify) {
+        receipt.verified = {
+          changed: Number(verify[1]),
+          unchanged: Number(verify[2]),
+          failed: Number(verify[3]),
+        };
+      }
+      return { content: text, receipt };
+    },
+  };
+
+  if (transientOn) ctx.tools.registerTransient(runTransient);
+  else ctx.tools.register(runTool);
 
   ctx.effect(() => () => {
     ctx.logger.info("hands 已清理");

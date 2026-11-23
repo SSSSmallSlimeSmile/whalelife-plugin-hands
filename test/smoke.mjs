@@ -5,7 +5,8 @@
  * 不依赖插件装在宿主里的位置：允许根目录就是当前工作目录（本仓库根），
  * 写测试的临时文件落在 .tmp/ 下，跑完删掉；备份落在 data/backups/（已在 .gitignore）。
  *
- * 这里仍然模拟宿主提供 registerTransient：手已经不用它了，留着是为了确认即便宿主
+ * 这里模拟宿主同时提供 register 和 registerTransient：hands_run 走临时输出，
+ * 正文只当轮，回执是有界 JSON。其余工具仍走普通 register。
  */
 import { mkdir, rm, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -87,15 +88,18 @@ check(
   verify.split("\n")[1] ?? verify.split("\n")[0],
 );
 
-// 9 只返回文本：没有回执对象，也不带「文件未验证」这类尾注
-const plain = await raw("hands_run", { command: 'Write-Output "临时正文"' });
+// 9 临时输出：正文只当轮，回执是有界 JSON，且不抄正文
+const plain = await raw("hands_run", { command: "Write-Output ('临时' + '正文')" });
+const receiptText = JSON.stringify(plain?.receipt ?? null);
 check(
-  "hands_run 只返回文本（无回执、无尾注）",
-  typeof plain === "string"
-    && plain.includes("临时正文")
-    && plain.startsWith("退出码 0")
-    && !plain.includes("未声明 verify_files"),
-  String(plain).split("\n")[0],
+  "hands_run 正文当轮、回执极简",
+  !!plain && typeof plain === "object"
+    && String(plain.content).includes("临时正文")
+    && String(plain.content).startsWith("退出码 0")
+    && plain.receipt?.exit_code === 0
+    && plain.receipt?.tool === "hands_run"
+    && !receiptText.includes("临时正文"),
+  receiptText.slice(0, 120),
 );
 
 // 10 覆盖前留副本
