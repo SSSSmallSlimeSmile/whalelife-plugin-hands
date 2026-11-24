@@ -299,6 +299,27 @@ node -e "const t=require('fs').readFileSync('out.json','utf8');console.log(JSON.
 **不是禁令**　这是分工，不是「一律不许用 PowerShell」。
 改文件优先用 `hands_write`（它本身就是 node 在写），跑系统命令再用 `hands_run`。
 
+**已经写进代码了**（2026-11-25）
+上面这段以前只是写在这里给我自己看，靠自觉。现在 `hands_run` 生成的每条脚本开头都会带：
+
+```
+$PSDefaultParameterValues['Get-Content:Encoding'] = 'utf8'
+$PSDefaultParameterValues['Import-Csv:Encoding'] = 'utf8'
+```
+
+命令原样不动、不拦、不改写。实测同一个 UTF-8 中文 JSON：
+
+| | 字符数 | 含「勘」 | ConvertFrom-Json |
+|---|---|---|---|
+| 不设默认值 | 72 | 否 | 失败 |
+| 设了默认值 | 62 | 是 | 通过 |
+
+显式写 `-Encoding Default` 仍然以显式为准（回到 72、不含），读 GBK 文件不受影响。
+
+刻意**没有**设 `[Console]::OutputEncoding`：那会连带改原生命令的解码，`ipconfig` 这类中文输出会烂掉。这条实测过，中文仍正常。
+
+所以「读文件走 node」现在有两层：代码把最常见的入口掰正了，剩下真要用 PowerShell 解析输出的，仍按上面的分工走。
+
 ## 测试
 
 ```

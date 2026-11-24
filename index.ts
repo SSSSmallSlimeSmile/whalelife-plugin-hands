@@ -104,6 +104,12 @@ async function runShell(command: string, cwd: string, timeout: number, signal?: 
     // 末尾补一句退出码：脚本最后一条命令失败时给个非零，否则 -File 恒为 0。
     const body = "$env:PATH = '" + binDir + ";' + $env:PATH\n"
       + (prelude ? "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n$OutputEncoding = [Text.Encoding]::UTF8\n" : "")
+      // 读文件一律按 UTF-8：PowerShell 5.1 的 Get-Content 默认走 ANSI 代码页（936），
+      // 读自己写的 UTF-8 文件会读出「鏆傛椂」这类字，长度还会漂。设成默认参数以后，
+      // 命令原样不动、也不拦，显式写 -Encoding 的仍以显式为准。
+      // 刻意不设 [Console]::OutputEncoding：那会连带改原生命令的解码，ipconfig 这类中文输出会坏。
+      + "$PSDefaultParameterValues['Get-Content:Encoding'] = 'utf8'\n"
+      + "$PSDefaultParameterValues['Import-Csv:Encoding'] = 'utf8'\n"
       + command + "\nif (-not $?) { exit 1 }\n";
     await writeFile(file, Buffer.concat([
       Buffer.from([0xef, 0xbb, 0xbf]),
