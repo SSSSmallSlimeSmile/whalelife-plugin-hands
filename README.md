@@ -272,6 +272,33 @@ gh issue view 13 --json title
 
 **顺便**：双重编码的「膨胀率」也不可靠。今早把 `publish.ts` 写坏那次是 23928 → 26231（1.10x），拿乱码结果再写回去只有 1.01x —— 两次都不显眼，但内容都坏了。所以写完必须**回读比对**，不能靠大小猜。
 
+### 13. 处理文本的活别交给 PowerShell，交给 node
+
+**分界**（按「碰的是什么」分，不按喜好分）：
+
+- **碰字符串、编码、JSON 的 → node**：读文件、解析命令输出、写配置、改源码。
+  node 默认 UTF-8、写出来不带 BOM，`JSON.parse` 本身就是一次校验。
+- **碰系统状态的 → 还走 PowerShell**：进程、端口、窗口句柄、结束进程、列目录。
+  这些在 node 里没有现成路子，硬换是绕远。
+
+**为什么**　第 10 条和第 12 条不是两个孤立的坑，是同一层的毛病：
+PowerShell 5.1 收原生命令输出时按控制台代码页解，写文件默认带 BOM，
+`ConvertFrom-Json` 又在编码已经错了之后只给你一句「解析不了」。
+用 node 处理文本，这两类问题一起绕过去。
+
+**一个具体例子**　`gh issue view --json` 的输出：
+
+```
+gh issue view 13 --json title > out.json
+node -e "const t=require('fs').readFileSync('out.json','utf8');console.log(JSON.parse(t).title)"
+```
+
+重定向拿到原始字节，node 按 UTF-8 解。比在 PowerShell 里 `ConvertFrom-Json` 稳，
+也比临时开 `[Console]::OutputEncoding` 省事——那一手只在必须让 PowerShell 自己解析输出时才值得用。
+
+**不是禁令**　这是分工，不是「一律不许用 PowerShell」。
+改文件优先用 `hands_write`（它本身就是 node 在写），跑系统命令再用 `hands_run`。
+
 ## 测试
 
 ```
