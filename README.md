@@ -346,6 +346,33 @@ require("fs").writeFileSync("fix.patch", r.stdout);   // Buffer 直接落盘
 这条是 11-26 做 `shells-full-patch` 时补的：`git diff` 重定向到 .patch，中文全成替换符，
 `git apply --check` 报的却是锚点不匹配——看着像补丁内容错，其实是编码错。
 
+**已经写进代码了**（2026-11-26）
+和「读」那层一样，这条也不是只写在文档里。`hands_run` 生成的脚本开头现在还有三行：
+
+```
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'
+$PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
+```
+
+实测同一条命令（`"中文测试 kan" > out.txt`）：
+
+| | 字节 | 首字节 | 结果 |
+|---|---|---|---|
+| 设之前（`>`） | 22 | `ff fe` | UTF-16LE，任何 UTF-8 工具读着都是乱码加空字节 |
+| 设之后（`>`） | 21 | `ef bb bf` | UTF-8，带 BOM |
+| 设之前（`Set-Content`） | — | `d6 d0` | GBK 字节，汉字全变乱码 |
+| 设之后（`Set-Content`） | — | `ef bb bf` | UTF-8，带 BOM |
+
+**只做到一半，得说清**：PS 5.1 的 `Out-File` 没有无 BOM 那一档（`utf8NoBOM` 是 6+ 才有），
+所以重定向出来的仍是带 BOM 的 UTF-8。后果：
+
+- `JSON.parse` 会直接抛 `Unexpected token`——它不跳 BOM
+- `.patch` 里带 BOM，`git apply` 实测能过，但别的工具不一定宽容
+
+所以要**无 BOM 的产物，仍然只有 node 那条路**：`spawnSync` 抓 stdout 的 Buffer，直接 `writeFileSync`。
+代码里这三行只是把「彻底读不了」变成「多少能用」，不是终解。
+
 ## 测试
 
 ```

@@ -110,6 +110,15 @@ async function runShell(command: string, cwd: string, timeout: number, signal?: 
       // 刻意不设 [Console]::OutputEncoding：那会连带改原生命令的解码，ipconfig 这类中文输出会坏。
       + "$PSDefaultParameterValues['Get-Content:Encoding'] = 'utf8'\n"
       + "$PSDefaultParameterValues['Import-Csv:Encoding'] = 'utf8'\n"
+      // 写文件那一层：PowerShell 5.1 的 `>` 重定向（Out-File）默认写 UTF-16LE，
+      // Set-Content / Add-Content 默认走 ANSI 代码页（936，即 GBK）。
+      // 两者产出都不是 UTF-8：前者任何 UTF-8 工具读着都是乱码加空字节，后者汉字变 GBK 字节。
+      // 设成 utf8 后至少是标准 UTF-8（带 BOM）。
+      // 注意：BOM 仍在——JSON.parse 会因为 BOM 报错，.patch 里带 BOM 大部分工具能过但不保险。
+      // 要无 BOM，仍得走 node 的 writeFileSync，那是 README 里那条。
+      + "$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'\n"
+      + "$PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'\n"
+      + "$PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'\n"
       + command + "\nif (-not $?) { exit 1 }\n";
     await writeFile(file, Buffer.concat([
       Buffer.from([0xef, 0xbb, 0xbf]),
