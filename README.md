@@ -320,6 +320,32 @@ $PSDefaultParameterValues['Import-Csv:Encoding'] = 'utf8'
 
 所以「读文件走 node」现在有两层：代码把最常见的入口掰正了，剩下真要用 PowerShell 解析输出的，仍按上面的分工走。
 
+**还有一层：命令输出落盘**（2026-11-26）
+
+上面说的都是「读」。反过来把命令输出写进文件时，同一个编码问题会以另一种方式出现：
+
+```
+git diff > fix.patch          # > 走 PowerShell 重定向，中文可能被啃成替换符
+gh issue view 34 --json > x.json
+Select-String ... > note.md   # 管道解一遍、写一遍，错两次
+```
+
+症状很隐蔽：文件生成了、大小也对、`git apply` 只报一行锚点对不上，看着像补丁内容写错了。
+实际是文件里那几个汉字已经变成替换符，锚点自然匹配不上。
+
+**正确写法**：node 抓 stdout 的原始 buffer，直接 `writeFileSync`，中途不转字符串。
+
+```
+const { spawnSync } = require("child_process");
+const r = spawnSync("git", ["diff"], { maxBuffer: 64 * 1024 * 1024 });
+require("fs").writeFileSync("fix.patch", r.stdout);   // Buffer 直接落盘
+```
+
+写完回读三样：字节数、U+FFFD 计数、裸换行数量。三样都对才算写成。
+
+这条是 11-26 做 `shells-full-patch` 时补的：`git diff` 重定向到 .patch，中文全成替换符，
+`git apply --check` 报的却是锚点不匹配——看着像补丁内容错，其实是编码错。
+
 ## 测试
 
 ```
